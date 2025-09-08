@@ -17,6 +17,47 @@
 
 # the difference between these two commands is just --run_BO_on=all_fixed_features and --run_BO_on=all
 # --run_BO_on=all gives better results 
-CUDA_VISIBLE_DEVICES=2 python3 -u BO_runs_LLM_joint_optimization.py --contaminate=0 --iterations=100 --num_data=5000 --epochs=1 --trials=5 --evaluation_cuda=0 --sample_method=random --eval_tasks=gsm8k --experiments_setting=ood --output_dir=output_joint_optimization/results_updated --lora_rank=128 --time_limit=100 --ucb_beta=0.5 --limit=200 --run_BO_on=all_fixed_features >> printout_BO/BO_all_fixed_features.out
+# CUDA_VISIBLE_DEVICES=2 python3 -u BO_runs_LLM_joint_optimization.py --contaminate=0 --iterations=100 --num_data=5000 --epochs=1 --trials=5 --evaluation_cuda=0 --sample_method=random --eval_tasks=gsm8k --experiments_setting=ood --output_dir=output_joint_optimization/results_updated --lora_rank=128 --time_limit=100 --ucb_beta=0.5 --limit=200 --run_BO_on=all_fixed_features >> printout_BO/BO_all_fixed_features.out
 
-CUDA_VISIBLE_DEVICES=2 python3 -u BO_runs_LLM_joint_optimization.py --contaminate=0 --iterations=100 --num_data=5000 --epochs=1 --trials=5 --evaluation_cuda=0 --sample_method=random --eval_tasks=gsm8k --experiments_setting=ood --output_dir=output_joint_optimization/results_updated --lora_rank=128 --time_limit=100 --ucb_beta=0.5 --limit=100 --run_BO_on=all >> printout_BO/BO_all_rounding_features.out
+# CUDA_VISIBLE_DEVICES=2 python3 -u BO_runs_LLM_joint_optimization.py --contaminate=0 --iterations=100 --num_data=5000 --epochs=1 --trials=5 --evaluation_cuda=0 --sample_method=random --eval_tasks=gsm8k --experiments_setting=ood --output_dir=output_joint_optimization/results_updated --lora_rank=128 --time_limit=100 --ucb_beta=0.5 --limit=100 --run_BO_on=all >> printout_BO/BO_all_rounding_features.out
+
+CUDA_VISIBLE_DEVICES=0 python3 -u BO_runs_LLM_joint_optimization.py \
+  --contaminate=0 \
+  --iterations=100 \
+  --num_data=5000 \
+  --epochs=1 \
+  --trials=5 \
+  --evaluation_cuda=0 \
+  --sample_method=random \
+  --eval_tasks=gsm8k \
+  --experiments_setting=ood \
+  --output_dir=output_joint_optimization/results_updated \
+  --lora_rank=128 \
+  --time_limit=100 \
+  --ucb_beta=0.5 \
+  --limit=200 \
+  --run_BO_on=model \
+  > printout_BO/BO_model_only.out
+
+#   CUDA_VISIBLE_DEVICES=2 python3 -u BO_runs_LLM_joint_optimization.py \
+#   --contaminate=0 \
+#   --iterations=1 \
+#   --num_data=5000 \
+#   --epochs=1 \
+#   --trials=1 \
+#   --evaluation_cuda=0 \
+#   --sample_method=random \
+#   --eval_tasks=gsm8k \
+#   --experiments_setting=ood \
+#   --output_dir=output_joint_optimization/single_eval \
+#   --lora_rank=128 \
+#   --time_limit=100 \
+#   --ucb_beta=0.5 \
+#   --limit=200 \
+#   --run_BO_on=single_eval \
+#   --init_mixing_ratio=0.0,1.0 \
+#   --init_lora_num_layers=16 \
+#   --init_lora_modules=1,0,1,0,1 \
+#   --init_lora_rank=64 \
+#   --init_lora_dropout=0.05 \
+#   > printout_BO/single_eval.out
