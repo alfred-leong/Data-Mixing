@@ -8,6 +8,7 @@ from botorch.models.transforms.outcome import Standardize
 import shutil
 import torch
 import os
+os.environ["HF_ALLOW_CODE_EXECUTION"] = "1"
 from typing import List, Tuple, Optional
 import json, hashlib, random
 from itertools import product, cycle
@@ -3074,6 +3075,8 @@ def decode_to_config_dkl(
 
 #     return GP_input, observed_output, gp    
 
+from botorch.settings import debug
+
 # Fix deadlock
 def joint_opt_BO_LLM_with_dkl(
     time_callback,
@@ -3197,9 +3200,12 @@ def joint_opt_BO_LLM_with_dkl(
             shutil.rmtree(lora_path, ignore_errors=True)  # new
             for task in evaluation_task:
                 task_weight, metric = evaluation_task[task]
-                perf = results["results"][task][metric]
+                if task == "ai2_arc":
+                    perf = results["results"]["arc_challenge"][metric]
+                else:
+                    perf = results["results"][task][metric]
                 if task == "wikitext":
-                    perf = -perf
+                    perf = - perf # we want to maximize the score, so for perplexity we maximize instead
                 observed_performance += (perf * task_weight)
 
         print("current iteration weighted performance: ", observed_performance)
@@ -3216,6 +3222,17 @@ def joint_opt_BO_LLM_with_dkl(
 
         gp = SingleTaskGP(train_X, train_Y, covar_module=deep_kernel, outcome_transform=Standardize(m=1))
         mll = ExactMarginalLogLikelihood(gp.likelihood, gp)
+
+        #debug pubmed
+        print(
+            "Y finite:", np.isfinite(observed_output).all(),
+            "Y std:", (np.std(observed_output) if len(observed_output) > 1 else "n/a"),
+            "X dup:", (len(GP_input) != len({tuple(x) for x in GP_input}))
+        )
+
+        with debug(True):
+            fit_gpytorch_mll(mll)  # will surface the inner exception with stack + context
+            
         fit_gpytorch_mll(mll)
         
         UCB = UpperConfidenceBound(gp, beta=ucb_beta)

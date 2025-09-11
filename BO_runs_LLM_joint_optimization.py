@@ -1,6 +1,8 @@
 import json
 from BO import run_BO_for_LLM, joint_opt_BO_LLM, joint_opt_BO_LLM_only_model, joint_opt_random, joint_opt_BO_LLM_only_data, joint_opt_BO_LLM_fixed_feature_list, evaluate_single_configuration, joint_opt_BO_LLM_with_vae, joint_opt_BO_LLM_with_dkl
-
+import os
+os.environ["HF_DATASETS_TRUST_REMOTE_CODE"] = "1"  # allows datasets to run repo code
+os.environ["HF_ALLOW_CODE_EXECUTION"] = "1"       # older stacks sometimes check this
 from argparse import ArgumentParser
 from transformers import TrainerCallback
 import time

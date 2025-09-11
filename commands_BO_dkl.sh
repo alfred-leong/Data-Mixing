@@ -11,24 +11,23 @@
 # TASKS=("mmlu") #GPU4 (500s, started on 25 aug, speed)
 
 
-TASKS=("gsm8k") # GPU 4 gsm8k_29aug
-'''
-5 Sep:
-GPU 4: gsm8k, dim=8, hidden=128
-GPU 5: gsm8k, dim=8, hidden=64
-GPU 6: gsm8k, dim=8, hidden=32
-GPU 7: gsm8k, dim=10, hidden=64
+# TASKS=("gsm8k") # GPU 4 gsm8k_29aug
+# '''
+# 5 Sep:
+# GPU 4: gsm8k, dim=8, hidden=128
+# GPU 5: gsm8k, dim=8, hidden=64
+# GPU 6: gsm8k, dim=8, hidden=32
+# GPU 7: gsm8k, dim=10, hidden=64
 
-8 Sep:
-GPU 7: gsm8k, dim=10, hidden=128
-'''
+# 8 Sep:
+# GPU 7: gsm8k, dim=10, hidden=128
+# '''
 
 # TASKS=("triviaqa")   # GPU 5
 # TASKS=("commonsense_qa")   # GPU 6
 # TASKS=("headqa_en")   # GPU 7
 
-MODES=("dkl")
-GPUS=(7)
+
 # for task in "${TASKS[@]}"; do
 #   mkdir -p "printout_BO/full_run_dkl/${task}"
 #   for i in "${!MODES[@]}"; do
@@ -62,6 +61,33 @@ GPUS=(7)
 # wait
 set -Eeuo pipefail
 
+# '''
+# 8 Sep (dim=10, hidden=64) FULL RUN:
+# GPU 0: headqa_en,  sciq (all done)
+# GPU 1: gsm8k (done), "commonsense_qa", "triviaqa"
+# GPU 7: "truthfulqa_gen" "mmlu"
+# CRASHED: wikitext, ai2_arc, pubmedqa
+
+# 10 Sep:
+# GPU 0: pubmedqa (rerun)
+# GPU 6: ai2_arc, wikitext (wikitext rerun)
+# CRASHED: pubmedqa, wikitext, mmlu
+
+# 11 Sep:
+# GPU 1: triviaqa
+# GPU 5: pubmedqa (crash)
+# GPU 6: mmlu
+# GPU 7: wikitext (crash)
+# CRASHED: pubmedqa, wikitext, mmlu
+
+# '''
+# TASKS=("headqa_en" "pubmedqa" "sciq" )   
+# TASKS=("gsm8k" "commonsense_qa" "triviaqa") 
+# TASKS=("truthfulqa_gen" "wikitext" "mmlu") 
+TASKS=("pubmedqa")
+
+MODES=("dkl")
+GPUS=(5)
 USE_LOCAL_ONLY="${USE_LOCAL_ONLY:-0}"
 
 for task in "${TASKS[@]}"; do
@@ -135,7 +161,7 @@ for task in "${TASKS[@]}"; do
       --limit=100 \
       --run_BO_on="${mode}" \
       --seed=0 \
-      --dkl_feature_dim=8 \
+      --dkl_feature_dim=10 \
       --dkl_hidden=128 \
       ${LOCAL_FLAG} \
       > "${STDOUT_FILE}" \
