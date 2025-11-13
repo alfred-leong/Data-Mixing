@@ -1,9 +1,10 @@
 import json
-from BO import run_BO_for_LLM, joint_opt_BO_LLM, joint_opt_BO_LLM_only_model, joint_opt_random, joint_opt_BO_LLM_only_data, joint_opt_BO_LLM_fixed_feature_list, evaluate_single_configuration, joint_opt_BO_LLM_with_vae
+from BO import run_BO_for_LLM, joint_opt_BO_LLM, joint_opt_BO_LLM_only_model, joint_opt_random, joint_opt_BO_LLM_only_data, joint_opt_BO_LLM_fixed_feature_list, evaluate_single_configuration, joint_opt_BO_LLM_with_vae, joint_opt_BO_LLM_interleave
 
 from argparse import ArgumentParser
 from transformers import TrainerCallback
 import time
+
 
 run_name = "BO_runs_LLM_joint_optimization"
 parser = ArgumentParser()
@@ -29,6 +30,8 @@ parser.add_argument("--init_lora_num_layers", help="Only for  manual input: init
 parser.add_argument("--init_lora_modules", help="Only for  manual input: initial lora modules, comma separated, len=5", default=None) # e.g. 1,0,0,1,1
 parser.add_argument("--init_lora_rank", help="Only for  manual input: initial lora rank", default=None) # e.g. 16
 parser.add_argument("--init_lora_dropout", help="Only for  manual input: initial lora dropout", default=None) # e.g. 0.05
+parser.add_argument("--iteration", help="Only for  manual input, extrapolation purposes", default=1) # e.g. 1
+parser.add_argument("--idx", help="Only for  manual input, extrapolation purposes eg. trial_{idx}.json", default=1) # e.g. 1
 parser.add_argument("--vae_dim", help="latent dim for VAE-BO", type=int, default=10)
 parser.add_argument(
     "--vae_hidden",
@@ -164,12 +167,15 @@ final_info_stored = {"command line args": args,
 
 for sample_method in sample_methods: # random sampling
     results = []
+    print("num of trials: ", trials)
     for x in range(trials):
         #model_id="Qwen/Qwen2.5-7B-Instruct" # pass this into next function if necessary
         #model_id: str = "LLM/llama_8b_instruct"
         
-        rng = random.Random()
-        seed = rng.randint(0, 1000)
+        # rng = random.Random()
+        # seed = rng.randint(0, 1000)
+
+        seed = x
 
         if run_BO_on == "all": # run BO on both data and model
             print("running BO on both data and model")
@@ -188,7 +194,7 @@ for sample_method in sample_methods: # random sampling
                                                             ucb_beta=ucb_beta,
                                                             limit=limit,
                                                             printout=True,
-                                                            seed=seed,
+                                                            seed=args["seed"],
                                                             output_dir=output_dir)
         elif run_BO_on == "all_fixed_features": # run BO on both data and model, but with some discrete optimization tricks; somehow this doesn't work well.
             print("running BO on both data and model with fixed feature list")
@@ -228,7 +234,7 @@ for sample_method in sample_methods: # random sampling
         elif run_BO_on == "data":
             print("running BO only on data")
             GP_input, observed_output, gp = joint_opt_BO_LLM_only_data(time_callback=TimerCallback(time_limit), default_alpha=16, default_dropout=0.05, default_layer=[1,1,1,1,1],
-                                                                       default_num_layers_to_apply=16, default_rank=72,
+                                                                       default_num_layers_to_apply=14, default_rank=72,
                                                                        data_domains = data_domains,
                                                                         random_dir = random_string, 
                                                                         BO_run = BO_run,
@@ -244,7 +250,7 @@ for sample_method in sample_methods: # random sampling
                                                                         ucb_beta=ucb_beta,
                                                                         limit=limit,
                                                                         printout=True,
-                                                                        seed=seed,
+                                                                        seed=args["seed"],
                                                                         output_dir=output_dir)
         elif run_BO_on == "random":
             print("using random configurations")
@@ -297,6 +303,7 @@ for sample_method in sample_methods: # random sampling
                                                             evaluation_cuda = cuda, 
                                                             evaluation_task = evaluation_task,
                                                             seed=args["seed"],
+                                                            # seed=seed,
                                                             sampling_method = sample_method, 
                                                             train_epochs=train_epochs, 
                                                             training_batch=training_batch, 
@@ -308,8 +315,30 @@ for sample_method in sample_methods: # random sampling
                                                             init_lora_modules=init_lora_modules,
                                                             init_lora_rank=init_lora_rank,
                                                             init_lora_dropout=init_lora_dropout,
+                                                            iteration=int(args["iteration"]),
+                                                            trial_idx = args["idx"],
+                                                            output_dir=output_dir,
                                                             )
             exit() # Exit after single eval, no need to continue
+        elif run_BO_on == "interleave":
+            print("running interleaved BO on both data and model")
+            GP_input, observed_output, gp = joint_opt_BO_LLM_interleave(time_callback=TimerCallback(time_limit), lora_rank_max=lora_rank, data_domains = data_domains,
+                                                        random_dir = random_string, 
+                                                            BO_run = BO_run,
+                                                            total_data = total_data, 
+                                                            evaluation_cuda = cuda, 
+                                                            evaluation_task = evaluation_task,
+                                                            trial_number=x,
+                                                            sampling_method = sample_method, 
+                                                            train_epochs=train_epochs, 
+                                                            training_batch=training_batch, 
+                                                            evaluation_batch=evaluation_batch,
+                                                            eval_steps=evaluation_steps,
+                                                            ucb_beta=ucb_beta,
+                                                            limit=limit,
+                                                            printout=True,
+                                                            seed=seed,
+                                                            output_dir=output_dir)
         else:
             assert False
 

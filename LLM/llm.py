@@ -14,7 +14,7 @@ from lm_eval.models.huggingface import HFLM
 import datasets
 import os
 import sys
-import random
+import json
 
 import transformers
 from datasets import load_dataset, concatenate_datasets
@@ -169,7 +169,7 @@ def sample(dataset, num_datapoints, additional_info, method, data_domain, seed):
     sampled_dataset = dataset.select(indices)
     return sampled_dataset
 
-def extract_data_mixture_and_train(model, random_dir, tokenizer, train_datasets, val_datasets, data_domains, mixing_ratio, additional_info, total_number_datapoints, run_name, seed=42, method="random", train_epochs=1, batch_size=8, max_step=-1, eval_steps=100, lora_config=None, callback=[], fix_training_samples=False):
+def extract_data_mixture_and_train(model, random_dir, tokenizer, train_datasets, val_datasets, data_domains, mixing_ratio, additional_info, total_number_datapoints, run_name, seed=42, method="random", train_epochs=1, batch_size=8, max_step=-1, eval_steps=100, lora_config=None, callback=[], fix_training_samples=False, results_dir="results/"):
 
 #     '''
 #     model: llama base model
@@ -210,6 +210,8 @@ def extract_data_mixture_and_train(model, random_dir, tokenizer, train_datasets,
     # print("ALL DATA DOMAINS: ", data_domains)
     all_sampled_train_data = []
     all_sampled_val_data = []
+    # save_results = {}
+    temp_val_dataset = []
     for train_dataset, val_dataset, data_domain, ratio, IF_values in zip(train_datasets, val_datasets, data_domains, mixing_ratio, additional_info):
         
         # print("doing sampling for domain: ", data_domain)
@@ -241,11 +243,39 @@ def extract_data_mixture_and_train(model, random_dir, tokenizer, train_datasets,
         
         all_sampled_train_data.append(sampled_train_data)
         all_sampled_val_data.append(sampled_val_data)
-    
+
+        # # save results
+        # save_results[data_domain] = {
+        #     "train_indices": train_indices,
+        #     "val_indices": val_indices,
+        #     "train_size": len(sampled_train_data),
+        #     "val_size": len(sampled_val_data),
+        # }
     combined_train_dataset = concatenate_datasets(all_sampled_train_data)
     combined_val_dataset = concatenate_datasets(all_sampled_val_data)
     print("length of training data: ", len(combined_train_dataset))
-    output_model_dir = train(model, tokenizer, combined_train_dataset, combined_val_dataset, output_dir, run_name, train_epochs, batch_size, max_step, eval_steps, lora_config=config, callback=callback)
+    # # Convert any numpy arrays in save_results to lists for JSON serialization
+    # def make_json_serializable(obj):
+    #     if isinstance(obj, np.ndarray):
+    #         return obj.tolist()
+    #     elif isinstance(obj, dict):
+    #         return {k: make_json_serializable(v) for k, v in obj.items()}
+    #     elif isinstance(obj, list):
+    #         return [make_json_serializable(v) for v in obj]
+    #     else:
+    #         return obj
+
+    output_model_dir, training_time = train(model, tokenizer, combined_train_dataset, temp_val_dataset, output_dir, run_name, train_epochs, batch_size, max_step, eval_steps, lora_config=config, callback=callback)
+
+    # serializable_results = make_json_serializable(save_results)
+    # output_json = {
+    #     "training_time": training_time,
+    #     "training_samples": len(combined_train_dataset),
+    #     "data_info": serializable_results
+    # }
+    # os.makedirs(results_dir, exist_ok=True)
+    # with open(results_dir + f"/training_info_{total_number_datapoints}.json", "w") as f:
+    #     json.dump(output_json, f, indent=4)
     return output_model_dir
     
 def train(model, tokenizer, train_dataset, val_dataset, output_dir, run_name, train_epochs=1, batch_size=8, max_step=-1, eval_steps=100, lora_config=None, callback=[]):
@@ -253,13 +283,24 @@ def train(model, tokenizer, train_dataset, val_dataset, output_dir, run_name, tr
     #     # keeps Trainer from trying its own DataParallelism when more than 1 gpu is available
     model.is_parallelizable = False
     model.model_parallel = False
-    
+
+    csqa_train_dataset, csqa_val_dataset = load_data(data_domain="commonsense_qa")
+    csqa_val_dataset = csqa_val_dataset.select(range(20))
+    csqa_val_dataset = csqa_val_dataset.shuffle(seed=42).map(generate_and_tokenize_prompt_commonsenseQA, 
+                                                             fn_kwargs={"tokenizer": tokenizer,
+                                                                        "add_eos_token": add_eos_token,
+                                                                        "train_on_inputs": train_on_inputs,
+                                                                        })
+    csqa_val_dataset = csqa_val_dataset.select_columns(['input_ids', 'attention_mask', 'labels'])
+    print("confirming val_dataset...")
+    print(len(csqa_val_dataset))
+    print("len of callback list: ", len(callback))
     transformers.set_seed(42)
     model.train()
     trainer = transformers.Trainer(
         model=model,
         train_dataset=train_dataset,
-        eval_dataset=val_dataset,
+        eval_dataset=csqa_val_dataset,
         args=transformers.TrainingArguments(
             per_device_eval_batch_size=batch_size,
             per_device_train_batch_size=batch_size,
@@ -268,19 +309,19 @@ def train(model, tokenizer, train_dataset, val_dataset, output_dir, run_name, tr
             num_train_epochs=train_epochs,
             learning_rate=learning_rate,
             bf16=True,
-            logging_steps=20,
+            logging_steps=40,
             optim="adamw_torch",
             save_strategy="steps",
             eval_strategy="steps",
-            eval_steps=eval_steps,
+            eval_steps=40,
             save_total_limit=1,
-            save_steps=eval_steps,
+            save_steps=40,
             max_steps=max_step,
             output_dir=output_dir,
-            load_best_model_at_end=True,
+            load_best_model_at_end=False,
             ddp_find_unused_parameters=True,
             group_by_length=group_by_length,
-            report_to="wandb" if use_wandb else None,
+            report_to=None,
             run_name=run_name,
         ),
         data_collator=transformers.DataCollatorForSeq2Seq(
@@ -293,6 +334,8 @@ def train(model, tokenizer, train_dataset, val_dataset, output_dir, run_name, tr
     model.print_trainable_parameters()
     trainer.train()
 
+    training_time = trainer.state.log_history[-1]['train_runtime']
+    print("training time: ", training_time)
     print("saving final model LoRA weights at: ", output_dir + "/" + "final_model_after_training")
     model.save_pretrained(output_dir + "/" + "final_model_after_training")
     model.to("cpu")
@@ -301,7 +344,7 @@ def train(model, tokenizer, train_dataset, val_dataset, output_dir, run_name, tr
         torch.cuda.empty_cache()
     del model
     gc.collect()
-    return output_dir + "/" + "final_model_after_training"
+    return output_dir + "/" + "final_model_after_training", training_time
     
 def evaluate_tasks(tasks : List[str], model, tokenizer, batch=1, few_shot=1, limit=None):
 
@@ -314,13 +357,13 @@ def evaluate_tasks(tasks : List[str], model, tokenizer, batch=1, few_shot=1, lim
         results = lm_eval.simple_evaluate(
             model=lm,
             tasks=tasks,
-            task_manager=lm_eval.tasks.TaskManager(),batch_size=batch,max_batch_size=batch, num_fewshot=few_shot)
+            task_manager=lm_eval.tasks.TaskManager(),batch_size=batch,max_batch_size=batch, num_fewshot=few_shot, log_samples=True)
     else:
         results = lm_eval.simple_evaluate(
             model=lm,
             limit=limit,
             tasks=tasks,
-            task_manager=lm_eval.tasks.TaskManager(),batch_size=batch,max_batch_size=batch, num_fewshot=few_shot)
+            task_manager=lm_eval.tasks.TaskManager(),batch_size=batch,max_batch_size=batch, num_fewshot=few_shot, log_samples=True)
     return results
 
 def load_data(data_domain):
