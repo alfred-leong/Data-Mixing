@@ -9,6 +9,7 @@ import shutil
 import torch
 from itertools import product
 import numpy as np
+from scipy.stats import qmc
 import random
 from typing import Optional, List
 import gc
@@ -23,6 +24,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 
 import matplotlib.pyplot as plt
+from LLM.tokenize_util import *
 
 from peft import (
     LoraConfig,
@@ -141,7 +143,7 @@ from LLM.llm import load_data, get_tokenizer_and_model, extract_data_mixture_and
 from LLM.llm import extract_data_mixture_and_train, evaluate_tasks, load_data, get_tokenizer_and_model
 
 from peft import PeftModel, PeftConfig
-from transformers import AutoTokenizer, AutoModelForCausalLM, Trainer, TrainingArguments, TrainerCallback
+from transformers import AutoTokenizer, AutoModelForCausalLM, Trainer, TrainingArguments, TrainerCallback, DataCollatorForSeq2Seq
 from tqdm import tqdm
 import os
 import json
@@ -279,6 +281,8 @@ def arrange_lora_config(lora_r, lora_dropout, num_layers_to_apply, five_dim_vect
 
     # lora r is chosen as 0
     if lora_r == 0:
+        return None
+    if alpha == 0:
         return None
     config = LoraConfig(
     r=lora_r,
@@ -1598,7 +1602,204 @@ def joint_opt_BO_LLM_only_model(time_callback, lora_rank_max, data_domains : Lis
         
     return GP_input, observed_output, gp
 
-def joint_opt_random(time_callback, lora_rank_max, data_domains : List[str], random_dir : str, BO_run : int, total_data : int, evaluation_cuda : str, evaluation_task : dict, ucb_beta, sampling_method = "random", train_epochs : int = 1, training_batch : int = 8, evaluation_batch : int = 4, printout=True, max_steps = -1, eval_steps=100, limit=100, model_id = "LLM/llama_8b_instruct"):
+class EvalCallback(TrainerCallback):
+    """
+    A custom callback to run lm_eval.simple_evaluate at set wall-clock time intervals 
+    (e.g., every 20 seconds).
+    """
+    def __init__(self, tokenizer, eval_interval_seconds, max_training_time, eval_tasks, eval_limit, results_dir, input_X, file_count, eval_loss_dataset):
+        self.tokenizer = tokenizer
+        self.eval_interval_seconds = eval_interval_seconds
+        self.max_training_time = max_training_time
+        self.eval_tasks = eval_tasks
+        self.eval_limit = eval_limit
+        self.results_dir = results_dir
+        self.input_X = input_X
+        self.eval_history = []
+        self.file_count = file_count
+        self.eval_loss_dataset = eval_loss_dataset
+        self.data_collator = DataCollatorForSeq2Seq(
+            tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
+        )
+        
+        # Internal state to track time and steps
+        self.start_time = None
+        self.last_eval_time = 0.0
+        self.cumulative_training_time = 0.0
+        
+        # Initialize TaskManager outside the loop for efficiency
+        self.task_manager = lm_eval.tasks.TaskManager()
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        """Called at the start of training to record the initial time."""
+        self.start_time = time.time()
+        # Initialize a new variable to track time spent *training* since the last evaluation
+        self.training_time_since_last_eval = 0.0 
+        self.last_step_time = time.time() # To measure the time of the last step
+        
+        current_model = kwargs.get('model')
+        self._run_evaluation(current_model, state)  # Initial evaluation at step 0
+        print(f"[{time.strftime('%H:%M:%S')}] Initial evaluation done. Start training... Wall-clock evaluation will run every {self.eval_interval_seconds} seconds of actual training.")
+        
+
+    def on_step_end(self, args, state, control, **kwargs):
+        """Called at the end of every training step."""
+
+        # 1. Calculate the time taken for the last training step
+        training_time_for_this_step = time.time() - self.last_step_time
+        
+        # 2. Add this time to the counter for training time
+        self.training_time_since_last_eval += training_time_for_this_step
+        # NEW: Add to the cumulative total
+        self.cumulative_training_time += training_time_for_this_step
+
+        current_model = kwargs.get('model')
+
+        # Terminate training if max training time is reached
+        if self.cumulative_training_time >= self.max_training_time:
+            print(f"\n[{time.strftime('%H:%M:%S')}] Maximum training time reached. Ending training...")
+            self._run_evaluation(current_model, state)
+            control.should_log = True
+            control.should_save = True
+            control.should_training_stop = True
+            return control
+
+        # 4. Check if the required interval of *training* time has passed
+        if self.training_time_since_last_eval >= self.eval_interval_seconds:
+        
+            print(f"\n[{time.strftime('%H:%M:%S')}] Cumulative training time ({self.cumulative_training_time:.1f}s total elapsed). Running evaluation...")
+            # Run the lm_eval evaluation
+            self._run_evaluation(current_model, state)
+            
+            # RESET the training time tracker, NOT the wall-clock time!
+            self.training_time_since_last_eval = 0.0 
+            
+            control.should_log = True
+            control.should_save = True
+            
+            print(f"\n[{time.strftime('%H:%M:%S')}] Resuming training.")
+
+        self.last_step_time = time.time()  # Update the last step time, excluding evaluation time
+
+        control.should_log = False
+        return control
+
+    def _evaluate_performance(self, current_model):
+        """Helper function to execute the evaluation harness."""
+        
+        # IMPORTANT: Wrap the model for the evaluation harness
+        from lm_eval.models.huggingface import HFLM
+        
+        # We assume the model is a HuggingFace model wrapper, and we pass the
+        # actual, fine-tuned model's device/dtype information via the wrapper.
+        lm_model = HFLM(
+            pretrained=current_model,
+            tokenizer=self.tokenizer,
+            device=current_model.device.type,
+        )
+        
+        # Note: We hardcode a small batch size to prioritize stability 
+        # during the evaluation interrupt. Adjust as needed.
+        perf_results = lm_eval.simple_evaluate(
+            model=lm_model,
+            limit=self.eval_limit,
+            tasks=list(self.eval_tasks.keys()),
+            task_manager=self.task_manager,
+            batch_size=4, 
+            num_fewshot=5, 
+            log_samples=False,
+            random_seed=42
+        )
+        perf = []
+        for task, value in self.eval_tasks.items():
+            _, metric = value
+            perf.append(perf_results["results"][task][metric])
+
+        return perf
+
+    def _evaluate_loss(self, current_model):
+        """Helper function to execute manual evaluation loss calculation."""
+        
+        # Use the objects stored in the class
+        eval_dataloader = DataLoader(
+            self.eval_loss_dataset,
+            collate_fn=self.data_collator,
+            batch_size=4 # Using a small batch size for stability, match your lm_eval batch size if possible
+        )
+        
+        # Determine the model's current device
+        device = current_model.device
+        current_model.eval() # Set model to evaluation mode
+
+        total_loss = 0.0
+        num_batches = 0
+
+        with torch.no_grad():
+            for inputs in eval_dataloader:
+                
+                # Move inputs (tensors) to the model's device
+                inputs = {k: v.to(device) for k, v in inputs.items()}
+                
+                # Forward Pass and Loss Calculation
+                # When 'labels' are present in inputs, the Hugging Face model 
+                # automatically calculates the loss (Cross-Entropy for MCQ)
+                outputs = current_model(**inputs)
+                
+                # Retrieve the loss tensor
+                loss = outputs.loss 
+                
+                total_loss += loss.item()
+                num_batches += 1
+
+        # Set model back to training mode
+        current_model.train() 
+
+        avg_loss = total_loss / num_batches if num_batches > 0 else None
+        return avg_loss
+    
+    def _run_evaluation(self, current_model, state):
+        """Helper function to execute performance and loss evaluations."""
+        # Evaluate performance using lm_eval
+        perf = self._evaluate_performance(current_model)
+        perf = perf[0] if len(perf) == 1 else perf  # only commonsense_qa
+
+        # Evaluate eval loss using Trainer
+        eval_loss = self._evaluate_loss(current_model)
+
+        current_elapsed_time = time.time() - self.start_time
+        step_results = {
+            "global_step": state.global_step,
+            "wall_clock_time_sec": current_elapsed_time,
+            "cumulative_training_time": self.cumulative_training_time,
+            "input_X": self.input_X,
+            "performance": perf,
+            "eval_loss": eval_loss
+        }
+        self.eval_history.append(step_results)
+
+        print(f"Eval Summary (Step {state.global_step} @ {current_elapsed_time:.1f}s):")
+        if perf is not None:
+            print(f"  Performance: {perf}")
+        else:
+            print("  Performance: N/A (Check model output and lm_eval settings)")
+        if eval_loss is not None:
+            print(f"  Evaluation Loss: {eval_loss:.6f}")
+        else:
+            print("  Evaluation Loss: N/A (Check model output and Trainer settings)")
+
+    def on_train_end(self, args, state, control, **kwargs):
+        """Called when training ends to save the final results."""
+        print(f"\nSaving evaluation history to {self.results_dir}...")
+        os.makedirs(self.results_dir, exist_ok=True)
+        output_file = os.path.join(self.results_dir, f"perf_eval_{self.file_count}.json")
+        try:
+            with open(output_file, 'w') as f:
+                json.dump(self.eval_history, f, indent=4)
+            print("Evaluation history successfully saved.")
+        except Exception as e:
+            print(f"Error saving evaluation history: {e}")
+
+def joint_opt_random(lora_rank_max, data_domains : List[str], random_dir : str, BO_run : int, total_data : int, evaluation_cuda : str, evaluation_task : dict, ucb_beta, sampling_method = "random", train_epochs : int = 1, training_batch : int = 8, evaluation_batch : int = 4, printout=True, max_steps = -1, eval_steps=100, limit=100, model_id = "LLM/llama_8b_instruct", seed=42, output_dir = "results/", trial_number=0, time_limit=1000):
 
     train_datasets = []
     val_datasets = []
@@ -1608,40 +1809,28 @@ def joint_opt_random(time_callback, lora_rank_max, data_domains : List[str], ran
         val_datasets.append(val_dataset)
 
     # get tokenizer and model
+    # model_id = "meta-llama/Meta-Llama-3-8B-Instruct"
+    # model_id = "Qwen/Qwen3-14B"
     tokenizer, model = get_tokenizer_and_model(model_id = model_id)
     lora_max_num_layers = len(model.model.layers)
+
+    # input_X = (len(data_domains))*[float(1/len(data_domains))] # initial X is balanced all
     
-    # input_X is the input to our GP:
-    # first len(data_domains) are the mixing ratio for data (0 to 1, constrained to sum to 1)
-    # next 1 dimension is the number of layers to apply to (integer)
-    # next 5 dimension vector to indicate which layer to apply to (0 or 1)
-    # then lora rank (integer)
-    # then lora dropout (float)
+    # # lora number of layers - use half the layers for first iteration
+    # input_X.append(int(lora_max_num_layers*0.5))
     
-    # input_X_between_0_1 is the standardized form of input_X (with everything between 0 and 1)
-    # We use this input for the BO to make optimization more stable.
+    # # apply lora to all modules for first iteration
+    # input_X = input_X + [1, 1, 1, 1, 1] # 5 dimension vector to indicate apply to all layers as initial input
     
-    # The following represents the inputs used for first iteration, so it's hard coded.
-    # mixing ratio - even ratio for all domains for first iteration
-    input_X = (len(data_domains))*[float(1/len(data_domains))] # initial X is balanced all
-    input_X_between_0_1 = (len(data_domains))*[float(1/len(data_domains))]
+    # # lora rank of 72 for first iteration
+    # input_X.append(72)
     
-    # lora number of layers - use half the layers for first iteration
-    input_X.append(int(lora_max_num_layers*0.5))
-    input_X_between_0_1.append(0.5)
-    
-    # apply lora to all modules for first iteration
-    input_X = input_X + [1, 1, 1, 1, 1] # 5 dimension vector to indicate apply to all layers as initial input
-    input_X_between_0_1 = input_X_between_0_1 + [1, 1, 1, 1, 1]
-    
-    # lora rank of 72 for first iteration
-    input_X.append(72)
-    input_X_between_0_1.append(72.0/lora_rank_max)
-    
-    # lora dropout of 0.05 for first iteration
-    input_X.append(0.05)
-    input_X_between_0_1.append(0.05)
-    
+    # # lora dropout of 0.05 for first iteration
+    # input_X.append(0.05)
+
+    # # lora alpha of 72 for first iteration - Set equal to lora rank, with double lora_rank_max as max
+    # input_X.append(72)
+
     # next, define bounds for BO (which interval should our values lie)
     # Recall that BO operates with input_X_between_0_1, which squashed everything to be in [0,1]
     # mixing ratio bounds
@@ -1650,7 +1839,7 @@ def joint_opt_random(time_callback, lora_rank_max, data_domains : List[str], ran
     
     # lora number of layers bounds
     lower_bound.append(0)
-    upper_bound.append(1)
+    upper_bound.append(lora_max_num_layers)
     
     # which layer to apply to bounds
     lower_bound+=[0, 0, 0, 0, 0]
@@ -1658,152 +1847,131 @@ def joint_opt_random(time_callback, lora_rank_max, data_domains : List[str], ran
     
     # lora rank bounds
     lower_bound.append(0)
-    upper_bound.append(1)
+    upper_bound.append(lora_rank_max)
     
     # lora dropout bounds; this one is not in [0,1] but in [0,0.1]
     lower_bound.append(0.0)
     upper_bound.append(0.1)
-    
-    # the actual bounds
-    bounds = torch.stack([torch.tensor(lower_bound), torch.tensor(upper_bound)])
-    
-    GP_input = [] # X
-    observed_output = [] # y
+
+    # lora alpha bounds
+    lower_bound.append(0)
+    upper_bound.append(2 * lora_rank_max)
+
 
     all_influences = [] # not used currently
     for train_domain in data_domains:
         all_influences.append(None)
         #all_influences.append(torch.load("influence/"+str(train_domain)+"_training.pt"))
     
+    csqa_train_dataset, csqa_val_dataset = load_data(data_domain="commonsense_qa")
+    csqa_val_dataset = csqa_val_dataset.select(range(100))
+    csqa_val_dataset = csqa_val_dataset.shuffle(seed=42).map(generate_and_tokenize_prompt_commonsenseQA, 
+                                                             fn_kwargs={"tokenizer": tokenizer,
+                                                                        "add_eos_token": False,
+                                                                        "train_on_inputs": False,
+                                                                        })
+    eval_dataset = csqa_val_dataset.select_columns(['input_ids', 'attention_mask', 'labels'])
+
+    def process_values(values, data_domains_len):
+        result = []
+        
+        # Step 1: Squash first `data_domains_len` elements if less than 0.05
+        for v in values[:data_domains_len]:
+            result.append(0 if v < 0.05 else v)
+
+        # Step 1.5: Normalize the first `data_domains_len` elements to sum to 1
+        sum_values = sum(result)
+        if sum_values > 0:
+            result = [v / sum_values for v in result]
+        
+        # Step 2: lora layers
+        if len(values) > data_domains_len:
+            result.append(round(values[data_domains_len]))
+        
+        # Step 3: Round the next 5 elements: integer options
+        start = data_domains_len + 1
+        for v in values[start:start+5]:
+            result.append(round(v))
+        
+        # Step 4: lora rank
+        if len(values) > start + 5:
+            result.append(round(values[start + 5]))
+        
+        # Step 5: drop out; unchanged
+        if len(values) > start + 6:
+            result.append(values[start + 6])
+
+        # Step 6: lora alpha
+        if len(values) > start + 7:
+            result.append(round(values[start + 7]))
+        return result
+    
     # for each BO iteration, do this...
     for i in tqdm(range(BO_run)):
         print("iteration: ", i)
-        print("input_X: ", input_X)
-        if printout:
-            print("mixing data with method: ", sampling_method)
-        
+        tokenizer, model = get_tokenizer_and_model(model_id = model_id)
+        print(f"Using model {model_id}...")
+
+        # Generate input_X and check if valid
+        # Generate random Sobol sequence samples
+        sampler = qmc.Sobol(d=len(lower_bound), scramble=True)
+        sobol_sequence_unit = sampler.random(n=1)
+
+        # Scale the sequence to the new bounds
+        random_generated_input = qmc.scale(
+            sample=sobol_sequence_unit, 
+            l_bounds=lower_bound, 
+            u_bounds=upper_bound
+        )[0]
+
+        input_X = process_values(random_generated_input, len(data_domains))
         # take the model related inputs and arrange them in a nice lora config file
-        lora_config = arrange_lora_config(input_X[-2], input_X[-1], input_X[len(data_domains)], input_X[len(data_domains)+1:len(data_domains)+6])
+        lora_config = arrange_lora_config(input_X[-3], input_X[-2], input_X[len(data_domains)], input_X[len(data_domains)+1:len(data_domains)+6], input_X[-1],)
+        print("input_X: ", input_X)
         
-        if lora_config is not None:
-            
-            # sample from each domain and train a model according to data mixture ratio
-            # and the chosen lora config file which determines the model architecture
-            # path_to_final_model is the path to the trained model
-            path_to_final_model = extract_data_mixture_and_train(model=model, random_dir=random_dir, tokenizer=tokenizer, 
-                                                            train_datasets=train_datasets, 
-                                                            val_datasets=val_datasets, 
-                                                            data_domains=data_domains, 
-                                                            mixing_ratio=input_X[:len(data_domains)], 
-                                                            additional_info=all_influences, # not used atm
-                                                            total_number_datapoints=total_data, 
-                                                            run_name="BO_run_" +str(i),
-                                                            method=sampling_method,
-                                                            train_epochs=train_epochs, 
-                                                            batch_size=training_batch,
-                                                            max_step=max_steps,
-                                                            lora_config=lora_config,
-                                                            eval_steps=eval_steps, callback=[time_callback])
-            # free the gpu memory
-            with torch.no_grad():
-                torch.cuda.empty_cache()
-            
-            # load the model from path_to_final_model
-            print("evaluating...")
-            lora_path = path_to_final_model
-            config = PeftConfig.from_pretrained(lora_path)
-            model = AutoModelForCausalLM.from_pretrained(config.base_model_name_or_path, torch_dtype='auto')
-            lora_model = PeftModel.from_pretrained(model, lora_path).to(evaluation_cuda)
-            tokenizer = AutoTokenizer.from_pretrained(config.base_model_name_or_path, trust_remote_code=True,)
-            
-            # ideally we only have one evaluation task. But the code below works
-            # for any weighted average of several task. But for now, we only use a single task.
-            # each task has a specified metric that's passed here.
-            observed_performance = 0
-            tasks = list(evaluation_task.keys())
-            results=evaluate_tasks(tasks, lora_model, tokenizer, evaluation_batch,few_shot=1, limit=limit)
-            for task in evaluation_task:
-                task_weight, metric = evaluation_task[task]
-                perf = results["results"][task][metric]
-                if task == "wikitext":
-                    perf = - perf # we want to maximize the score, so for wikitext perplexity we maximize instead
-                observed_performance += (perf * task_weight)
-            lora_model.to("cpu")
+        if not lora_config:
+            print("input_X not valid... try again for next iteration...")
+            continue
 
-            print("deleting lora model after evaluation.") # after evaluation, delete the model since no need already.
-            shutil.rmtree(lora_path, ignore_errors=True)
+        eval_callback = EvalCallback(
+            tokenizer=tokenizer,
+            eval_interval_seconds=20,
+            max_training_time=time_limit,
+            eval_tasks=evaluation_task,
+            eval_limit=limit,  # Number of eval samples
+            results_dir=output_dir,
+            input_X=input_X,
+            file_count = i,
+            eval_loss_dataset=eval_dataset
+        )
+            
+        # sample from each domain and train a model according to data mixture ratio
+        # and the chosen lora config file which determines the model architecture
+        # path_to_final_model is the path to the trained model
+        path_to_final_model = extract_data_mixture_and_train(model=model, random_dir=random_dir, tokenizer=tokenizer, 
+                                                        train_datasets=train_datasets, 
+                                                        val_datasets=val_datasets, 
+                                                        data_domains=data_domains, 
+                                                        mixing_ratio=input_X[:len(data_domains)], 
+                                                        additional_info=all_influences, # not used atm
+                                                        total_number_datapoints=total_data, 
+                                                        run_name="BO_run_" +str(i),
+                                                        method=sampling_method,
+                                                        train_epochs=train_epochs, 
+                                                        batch_size=training_batch,
+                                                        max_step=max_steps,
+                                                        lora_config=lora_config,
+                                                        eval_steps=eval_steps, callback=[eval_callback],
+                                                        seed=seed)
+        # free the gpu memory
+        with torch.no_grad():
+            torch.cuda.empty_cache()
         
-        else:
-            observed_performance = 0.1
+        print("deleting lora model after evaluation.")
+        base_path = path_to_final_model.rsplit('/', 1)[0] + '/'
+        shutil.rmtree(base_path, ignore_errors=True)
         
-        print("current iteration weighted performance: ", observed_performance)
-        # generate random candidate:
-        #[tensor(0.2207), tensor(0.2730), tensor(0.0525), tensor(0.2114), 0,
-        # tensor(0.1078), 0, tensor(0.1324), 10, 0, 0, 0, 0, 1, 34, 0.0748564749956131]
-        # length is len_domain + 1 + 5 + 1 + 1
-        def random_generator(data_domains, num_extra_vals=3, max_value=100):
-            result = []
-
-            # a) First len(data_domains) values sum to 1
-            weights = np.random.dirichlet(np.ones(len(data_domains))).tolist()
-            result.extend(weights)
-
-            # b) One random value between 0 and 1
-            result.append(random.uniform(0, 1))
-
-            # c) Next 5 values are either 0 or 1
-            result.extend([random.randint(0, 1) for _ in range(5)])
-
-            # d) Next num_extra_vals random values between 0 and 1
-            result.extend([random.uniform(0, 1) for _ in range(num_extra_vals)])
-
-            # e) Last value is between 0 and max_value
-            result.append(random.uniform(0, max_value))
-
-
-            return result
-
-        candidate = [random_generator(data_domains, 5, 0.1)]
-        
-        # next candidate are between [0,1] values.
-        # We need to perform some reverse engineering to make them into the correct values
-        # i.e., reverse normalization.
-        def process_values(values, data_domains_len):
-            result = []
-            
-            # Step 1: Squash first `data_domains_len` elements if less than 0.05
-            for v in values[:data_domains_len]:
-                result.append(0 if v.item() < 0.05 else v)
-            
-            # Step 2: lora layers
-            if len(values) > data_domains_len:
-                result.append(round(lora_max_num_layers*values[data_domains_len].item()))
-            
-            # Step 3: Round the next 5 elements: integer options
-            start = data_domains_len + 1
-            for v in values[start:start+5]:
-                result.append(round(v.item()))
-            
-            # Step 4: lora rank
-            if len(values) > start + 5:
-                result.append(round(lora_rank_max * values[start + 5].item()))
-            
-            # Step 5: drop out; unchanged
-            if len(values) > start + 6:
-                result.append(values[start + 6].item())
-            print("proposed candidate after processing:", result)
-            return result
-        print("proposed candidate before processing:", candidate[0])
-        
-        current_gp_input = list(input_X_between_0_1)
-        GP_input.append(current_gp_input)
-        observed_output.append(observed_performance)
-        
-        # these are updated with the candidates and used in next iteration
-        input_X_between_0_1 = list(candidate[0])
-        input_X = process_values(candidate[0], len(data_domains))
-        
-    return GP_input, observed_output
+    return
 
 def evaluate_single_configuration(time_callback, lora_rank_max, data_domains : List[str], random_dir : str, total_data : int, evaluation_cuda : str, evaluation_task : dict, seed : int, init_mixing_ratio: List[float] = None, init_lora_num_layers: int = None, init_lora_modules: List[int] = None, init_lora_rank: int = None, init_lora_dropout: float = None, sampling_method = "random", train_epochs : int = 1, training_batch : int = 8, evaluation_batch : int = 4, max_steps = -1, eval_steps=100, limit=100, model_id = "LLM/llama_8b_instruct", iteration=1, trial_idx=1, output_dir="results/") -> float:
 
@@ -2352,3 +2520,355 @@ def joint_opt_BO_LLM_with_vae(
         observed_output.append(perf)
 
     return GP_input, observed_output, gp
+
+# def sum_to_one(x: List[float]) -> List[float]:
+#     t = np.asarray(x, dtype=np.float32)
+#     s = float(t.sum())
+#     if s <= 1e-12:
+#         return (np.ones_like(t) / len(t)).tolist()
+#     return (t / s).tolist()
+
+# # Function to scale original raw params (18D) to [0,1] range, and the inverse
+# def scale_params(vec: List[float],
+#                  len_domains: int,
+#                  lora_max_layers: int = 32,
+#                  max_rank: int = 128,
+#                  direction: str = "forward") -> List[float]:
+    
+#     v = list(vec)
+#     D = len_domains
+
+#     if direction == "forward":
+#         # Normalise data mix ratio
+#         mix = sum_to_one(v[:D])
+
+#         # Scale layers by max_layers
+#         layers_scaled = 0.0 if lora_max_layers <= 0 else np.clip(v[D] / float(lora_max_layers), 0.0, 1.0)
+
+#         # Ensure flags are 0/1
+#         flags = [float(1.0 if f >= 0.5 else 0.0) for f in v[D+1:D+6]]
+
+#         # Scale rank by max_rank
+#         rank_scaled = float(v[D+6]) / float(max_rank)
+
+#         # Scale dropout
+#         dropout_scaled = np.clip(v[D+7] / 0.1, 0.0, 1.0)
+
+#         # Scale alpha by max_rank * 2
+#         alpha_scaled = float(v[D+8]) / float(max_rank * 2)
+
+#         return mix + [float(layers_scaled)] + flags + [float(rank_scaled)] + [float(dropout_scaled)] + [float(alpha_scaled)]
+
+#     elif direction == "inverse":
+#         # clamp to [0,1]
+#         x_0_to_1 = np.clip(np.asarray(v, dtype=np.float32), 0.0, 1.0)
+        
+#         # Normalise data mix ratio
+#         mix = sum_to_one(x_0_to_1[:D])
+
+#         # Scale layers by max_layers
+#         layers = int(round(float(x_0_to_1[D]) * float(lora_max_layers)))
+#         layers = int(np.clip(layers, 0, lora_max_layers))
+
+#         # Ensure flags are 0/1
+#         flags = [int(1 if z >= 0.5 else 0) for z in x_0_to_1[D+1:D+6]]
+#         if sum(flags) == 0:
+#             # force the strongest (largest u) to 1
+#             j = int(np.argmax(x_0_to_1[D+1:D+6]))
+#             flags[j] = 1
+
+#         # Scale rank by max_rank
+#         rank_raw = max(1, int(round(float(x_0_to_1[D+6]) * float(max_rank))))
+
+#         # Scale dropout
+#         drop = float(np.clip(x_0_to_1[D+7], 0.0, 1.0)) * 0.1
+
+#         # Scale alpha by max_rank * 2
+#         alpha_raw = max(1, int(round(float(x_0_to_1[D+8]) * float(max_rank * 2))))
+
+#         return mix + [layers] + flags + [rank_raw] + [drop] + [alpha_raw]
+
+#     else:
+#         raise ValueError("direction must be 'forward' or 'inverse'")
+
+# #DKL implementation
+# import torch
+# import torch.nn as nn
+
+# from gpytorch.kernels import Kernel, MaternKernel, RBFKernel, ScaleKernel
+# from gpytorch.utils.grid import ScaleToBounds
+
+# class FeatureModule(nn.Sequential):
+#     def __init__(self, dim_seq):
+#         super().__init__()
+#         assert len(dim_seq) >= 2
+#         for i in range(len(dim_seq) - 1):
+#             self.add_module(f'linear{i}', nn.Linear(dim_seq[i], dim_seq[i+1]))
+#             if i + 2 < len(dim_seq):
+#                 self.add_module(f'relu{i}', nn.ReLU())
+
+# class DeepKernel(Kernel):
+#     def __init__(self, dim_seq, base_kernel: Kernel = None, freeze_nn: bool = False,
+#                  use_scale_to_bounds: bool = True):
+#         super().__init__()
+#         self.feature_module = FeatureModule(dim_seq=dim_seq)
+#         if freeze_nn:
+#             self.feature_module.requires_grad_(False)
+#         self.kernel = ScaleKernel(MaternKernel(nu=2.5)) if base_kernel is None else base_kernel
+#         self.scale_to_bounds = ScaleToBounds(-1., 1.) if use_scale_to_bounds else None
+#         self.feature_module = self.feature_module.to(dtype=torch.double)
+
+#     def _transform(self, x: torch.Tensor) -> torch.Tensor:
+#         # Ensure dtype/device match the feature module
+#         fm_dtype = next(self.feature_module.parameters()).dtype
+#         fm_device = next(self.feature_module.parameters()).device
+#         x_f = x.to(dtype=fm_dtype, device=fm_device)
+#         z = self.feature_module(x_f)
+#         if self.scale_to_bounds is not None:
+#             z = self.scale_to_bounds(z)
+#         return z
+
+#     def forward(self, x1, x2, diag=False, **params):
+#         x1_t = self._transform(x1)
+#         x2_t = self._transform(x2)
+#         return self.kernel.forward(x1=x1_t, x2=x2_t, diag=diag, **params)
+
+# @torch.no_grad()
+# def decode_to_config_dkl(
+#     curr_vae_space: torch.Tensor,         # shape: (input_dim,), values in [0,1]
+#     len_domains: int,
+#     lora_max_layers: int,
+#     rank_max: int = 128
+# ) -> Tuple[List[float], List[float]]:
+#     # ensure 0..1 and renormalize mixture part
+#     X_between_0_to_1 = torch.clamp(curr_vae_space.detach().cpu().float(), 0.0, 1.0).tolist()
+#     X_between_0_to_1[:len_domains] = sum_to_one(X_between_0_to_1[:len_domains])
+#     x_raw = scale_params(X_between_0_to_1, len_domains, lora_max_layers, rank_max, direction="inverse")
+#     return x_raw, X_between_0_to_1
+
+# from botorch.settings import debug
+
+# # Fix deadlock
+# def joint_opt_BO_LLM_with_dkl(
+#     time_callback,
+#     lora_rank_max: int,
+#     data_domains: List[str],
+#     random_dir: str,
+#     BO_run: int,
+#     total_data: int,
+#     evaluation_cuda: str,
+#     evaluation_task: dict,
+#     ucb_beta: float,
+#     sampling_method: str = "random",
+#     train_epochs: int = 1,
+#     training_batch: int = 8,
+#     evaluation_batch: int = 4,
+#     printout: bool = True,
+#     max_steps: int = -1,
+#     eval_steps: int = 100,
+#     limit: int = 100,
+#     seed: int=42,
+#     output_dir: str = "results/",
+#     # DKL options:
+#     dkl_feature_dim: int = 8,
+#     dkl_hidden: int = 64,
+#     dkl_freeze_nn: bool = False,
+#     model_id: str = "LLM/llama_8b_instruct",
+# ):
+#     import os, gc  # new
+#     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")  # new
+#     os.environ.setdefault("OMP_NUM_THREADS", "1")  # new
+#     os.environ.setdefault("MKL_NUM_THREADS", "1")  # new
+#     torch.set_num_threads(1)  # new
+
+#     train_datasets = []
+#     val_datasets = []
+#     for data_domain in data_domains:
+#         train_dataset, val_dataset = load_data(data_domain=data_domain)
+#         train_datasets.append(train_dataset)
+#         val_datasets.append(val_dataset)
+
+#     lora_max_num_layers = 32
+    
+#     torch.manual_seed(seed)
+#     np.random.seed(seed)
+#     random.seed(seed)
+
+#     len_domains = len(data_domains)
+#     # input_X = (np.ones(len_domains) / len_domains).tolist()
+#     input_X = [1/len_domains] * len_domains
+#     input_X.append(int(lora_max_num_layers * 0.5))
+#     input_X += [1, 1, 1, 1, 1]
+#     input_X.append(72)
+#     input_X.append(0.05)
+#     input_X.append(72)
+
+#     input_X_between_0_1 = scale_params(
+#         input_X, len(data_domains), lora_max_num_layers, lora_rank_max, "forward"
+#     )
+    
+#     all_influences = []
+#     for train_domain in data_domains:
+#         all_influences.append(None)
+
+#     GP_input = []
+#     observed_output = []
+#     real_perf = []
+
+#     input_dim = len(data_domains) + 8
+#     assert len(input_X_between_0_1) == input_dim
+#     bounds = torch.stack([
+#         torch.zeros(input_dim, dtype=torch.double),
+#         torch.ones(input_dim, dtype=torch.double),
+#     ])
+#     model_id = "meta-llama/Meta-Llama-3-8B-Instruct"
+#     tokenizer, base_model_cpu = get_tokenizer_and_model(model_id=model_id)  # new
+#     base_model_cpu = base_model_cpu.to("cpu")  # new
+
+#     elapsed_callback = ElapsedTimeCallback()
+#     json_logger_callback = JsonLogCallback(output_dir=output_dir)
+
+#     for i in range(BO_run):
+#         if printout:
+#             print("iteration: ", i)
+#             print("input_X: ", input_X)
+#             print("mixing data with method: ", sampling_method)
+
+#         lora_config = arrange_lora_config(
+#             input_X[-2], input_X[-1], input_X[len(data_domains)],
+#             input_X[len(data_domains)+1:len(data_domains)+6]
+#         )
+#         if lora_config is None:
+#             observed_performance = 0.1
+#         else:
+#             print("Number of epochs: ", train_epochs)
+#             path_to_final_model = extract_data_mixture_and_train(
+#                 model=base_model_cpu,  # new
+#                 random_dir=random_dir, tokenizer=tokenizer, 
+#                 train_datasets=train_datasets,  
+#                 val_datasets=val_datasets, 
+#                 data_domains=data_domains, 
+#                 mixing_ratio=input_X[:len(data_domains)], 
+#                 additional_info=[None for _ in data_domains],
+#                 total_number_datapoints=total_data, 
+#                 run_name=f"BO_run_{i}_{os.getpid()}",  # new
+#                 method=sampling_method,
+#                 train_epochs=train_epochs, 
+#                 batch_size=training_batch,
+#                 max_step=max_steps,
+#                 lora_config=lora_config,
+#                 eval_steps=eval_steps, callback=[time_callback, elapsed_callback, json_logger_callback],
+#             )
+
+#             with torch.no_grad():
+#                 torch.cuda.empty_cache()
+#             print("evaluating...")
+#             lora_path = path_to_final_model
+#             lora_model = PeftModel.from_pretrained(base_model_cpu, lora_path).to(evaluation_cuda)  # new
+
+#             observed_performance = 0
+#             tasks = list(evaluation_task.keys())
+#             results = evaluate_tasks(tasks, lora_model, tokenizer, evaluation_batch, few_shot=1, limit=limit)
+#             print("deleting lora model after evaluation.")
+#             lora_model.to("cpu")  # new
+#             del lora_model  # new
+#             gc.collect()  # new
+#             torch.cuda.empty_cache()  # new
+#             shutil.rmtree(lora_path, ignore_errors=True)  # new
+#             for task in evaluation_task:
+#                 task_weight, metric = evaluation_task[task]
+#                 if task == "arc_challenge":
+#                     perf = results["results"]["arc_challenge"][metric]
+#                 else:
+#                     perf = results["results"][task][metric]
+#                 if task == "wikitext":
+#                     perf = - perf # we want to maximize the score, so for perplexity we maximize instead
+#                 observed_performance += (perf * task_weight)
+#                 real_perf.append(observed_performance * weight)
+        
+#         print("current iteration weighted performance raw: ", observed_performance)
+#         features = input_X + [50, observed_performance] # 50 seconds
+#         print(len(features))
+#         observed_performance = get_model_and_predict(features) 
+#         print("current iteration weighted performance from predictor: ", observed_performance)
+
+#         current_gp_input = torch.tensor(input_X_between_0_1, dtype=torch.double)
+#         GP_input.append(current_gp_input.tolist())
+#         observed_output.append(observed_performance)
+
+#         train_X = torch.tensor(GP_input, dtype=torch.double)
+#         train_Y = torch.tensor(observed_output, dtype=torch.double).view(-1,1)
+
+#         dim_seq = [input_dim, dkl_hidden, dkl_hidden, dkl_feature_dim]
+#         deep_kernel = DeepKernel(dim_seq=dim_seq, freeze_nn=dkl_freeze_nn)
+
+#         gp = SingleTaskGP(train_X, train_Y, covar_module=deep_kernel, outcome_transform=Standardize(m=1))
+#         mll = ExactMarginalLogLikelihood(gp.likelihood, gp)
+
+#         #debug pubmed
+#         print(
+#             "Y finite:", np.isfinite(observed_output).all(),
+#             "Y std:", (np.std(observed_output) if len(observed_output) > 1 else "n/a"),
+#             "X dup:", (len(GP_input) != len({tuple(x) for x in GP_input}))
+#         )
+
+#         with debug(True):
+#             fit_gpytorch_mll(mll)  # will surface the inner exception with stack + context
+            
+#         fit_gpytorch_mll(mll)
+        
+#         UCB = UpperConfidenceBound(gp, beta=ucb_beta)
+
+#         len_domains = len(data_domains)
+#         dtype = bounds.dtype
+#         device = bounds.device
+
+#         idx = torch.arange(len_domains, dtype=torch.long, device=device)
+#         coef = torch.ones(len_domains, dtype=dtype, device=device)
+#         rhs  = torch.tensor(1.0, dtype=dtype, device=device)
+
+#         candidate, acq_value = optimize_acqf(
+#             UCB,
+#             bounds=bounds,
+#             q=1,
+#             num_restarts=5,
+#             raw_samples=10,
+#             equality_constraints=[(idx, coef, rhs)],
+#         )
+#         cand = candidate[0].detach().cpu().float()
+#         print("proposed candidate before processing:", candidate[0])
+        
+#         def process_values(values, data_domains_len):
+#             result = []
+#             for v in values[:data_domains_len]:
+#                 result.append(0 if v.item() < 0.05 else v)
+#             if len(values) > data_domains_len:
+#                 result.append(round(lora_max_num_layers*values[data_domains_len].item()))
+#             start = data_domains_len + 1
+#             for v in values[start:start+5]:
+#                 result.append(round(v.item()))
+#             if len(values) > start + 5:
+#                 result.append(round(lora_rank_max * values[start + 5].item()))
+#             if len(values) > start + 6:
+#                 result.append(values[start + 6].item())
+#             print("proposed candidate after processing:", result)
+#             return result
+        
+#         input_X, input_X_between_0_1 = decode_to_config_dkl(curr_vae_space=candidate[0], len_domains=len_domains, lora_max_layers=lora_max_num_layers, rank_max=lora_rank_max)
+
+#         min_layers = 1
+#         min_rank   = 1
+#         min_drop   = 0.01
+#         max_drop   = 0.20
+
+#         layers = int(np.clip(input_X[len_domains], min_layers, lora_max_num_layers))
+#         flags5 = [1 if v >= 0.5 else 0 for v in input_X[len_domains+1:len_domains+6]]
+#         rank   = int(np.clip(input_X[len_domains+6], min_rank, lora_rank_max))
+#         drop   = float(np.clip(input_X[len_domains+7], min_drop, max_drop))
+
+#         input_X[len_domains]                     = layers
+#         input_X[len_domains+1:len_domains+6]    = flags5
+#         input_X[len_domains+6]                   = rank
+#         input_X[len_domains+7]                   = drop
+
+#     return GP_input, real_perf, gp

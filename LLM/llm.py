@@ -285,7 +285,7 @@ def train(model, tokenizer, train_dataset, val_dataset, output_dir, run_name, tr
     model.model_parallel = False
 
     csqa_train_dataset, csqa_val_dataset = load_data(data_domain="commonsense_qa")
-    csqa_val_dataset = csqa_val_dataset.select(range(20))
+    csqa_val_dataset = csqa_val_dataset.select(range(100))
     csqa_val_dataset = csqa_val_dataset.shuffle(seed=42).map(generate_and_tokenize_prompt_commonsenseQA, 
                                                              fn_kwargs={"tokenizer": tokenizer,
                                                                         "add_eos_token": add_eos_token,
@@ -311,11 +311,11 @@ def train(model, tokenizer, train_dataset, val_dataset, output_dir, run_name, tr
             bf16=True,
             logging_steps=40,
             optim="adamw_torch",
-            save_strategy="steps",
-            eval_strategy="steps",
-            eval_steps=40,
+            save_strategy="no",
+            eval_strategy="no",
+            # eval_steps=40,
             save_total_limit=1,
-            save_steps=40,
+            # save_steps=40,
             max_steps=max_step,
             output_dir=output_dir,
             load_best_model_at_end=False,

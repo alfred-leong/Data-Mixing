@@ -51,6 +51,9 @@ parser.add_argument(
     default=1e-3,
     help="Learning rate for the VAE optimizer."
 )
+parser.add_argument("--dkl_feature_dim", help="dkl feature dim", type=int, default=32)
+parser.add_argument("--dkl_hidden", help="dkl hidden layers", type=int, default=64)
+parser.add_argument("--dkl_freeze_nn", help="dkl freeze nn", type=bool, default=False)
 
 class TimerCallback(TrainerCallback):
     def __init__(self, max_duration_seconds):
@@ -196,6 +199,18 @@ for sample_method in sample_methods: # random sampling
                                                             printout=True,
                                                             seed=args["seed"],
                                                             output_dir=output_dir)
+        # elif run_BO_on == "JoBS":
+        #     print("running BO with DKL")
+        #     GP_input, observed_output, gp = joint_opt_BO_LLM_with_dkl(time_callback=TimerCallback(time_limit),
+        #                                                             lora_rank_max=lora_rank, data_domains=data_domains,
+        #                                                             random_dir=random_string, BO_run=BO_run, total_data=total_data,
+        #                                                             evaluation_cuda=cuda, evaluation_task=evaluation_task,
+        #                                                             ucb_beta=ucb_beta, sampling_method=sample_method,
+        #                                                             train_epochs=train_epochs, training_batch=training_batch,
+        #                                                             evaluation_batch=evaluation_batch, printout=True,
+        #                                                             max_steps=evaluation_steps, eval_steps=evaluation_steps,
+        #                                                             limit=limit, seed=seed, output_dir=output_dir,
+        #                                                             dkl_feature_dim=args["dkl_feature_dim"], dkl_hidden=args["dkl_hidden"],dkl_freeze_nn=args["dkl_freeze_nn"])
         elif run_BO_on == "all_fixed_features": # run BO on both data and model, but with some discrete optimization tricks; somehow this doesn't work well.
             print("running BO on both data and model with fixed feature list")
             GP_input, observed_output, gp = joint_opt_BO_LLM_fixed_feature_list(time_callback=TimerCallback(time_limit), lora_rank_max=lora_rank, data_domains = data_domains,
@@ -254,21 +269,26 @@ for sample_method in sample_methods: # random sampling
                                                                         output_dir=output_dir)
         elif run_BO_on == "random":
             print("using random configurations")
-            joint_opt_random(time_callback=TimerCallback(time_limit), lora_rank_max=lora_rank, data_domains = data_domains,
+            joint_opt_random(lora_rank_max=lora_rank, data_domains = data_domains,
                                                         random_dir = random_string, 
                                                             BO_run = BO_run,
                                                             total_data = total_data, 
                                                             evaluation_cuda = cuda, 
                                                             evaluation_task = evaluation_task,
                                                             sampling_method = sample_method, 
-                                                            train_epochs=train_epochs, 
+                                                            train_epochs=epochs, 
                                                             training_batch=training_batch, 
                                                             evaluation_batch=evaluation_batch,
                                                             eval_steps=evaluation_steps,
                                                             ucb_beta=ucb_beta,
                                                             limit=limit,
                                                             printout=True,
-                                                            seed=seed)
+                                                            seed=args["seed"],
+                                                            output_dir=output_dir,
+                                                            trial_number=x,
+                                                            time_limit=time_limit,
+                                                            model_id=model_id)
+            exit()  # exit after random run
         elif run_BO_on == "vae":
             print("running BO with VAE")
             GP_input, observed_output, gp = joint_opt_BO_LLM_with_vae(time_callback=TimerCallback(time_limit),
@@ -355,6 +375,7 @@ for sample_method in sample_methods: # random sampling
         results.append(max_until_now)
     final_info_stored[sample_method] = results
 print("final results: ", final_info_stored)
+
 # store results
 # try:
 #     with open("LLM/BO/" + output_dir + "/" +run_name+ "_".join(tasks)+".json", 'w') as f:
